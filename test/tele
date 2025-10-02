@@ -375,10 +375,27 @@ docs = list(results)
 Instructions:
 - Answer questions accurately using ONLY the information from the provided documents
 - If the documents don't contain enough information, say so clearly
-- Provide detailed, well-structured answers
+- Provide detailed, well-structured answers with inline citations
 - Use markdown formatting for better readability
 - When listing attendees or meetings, format them clearly
-- If asked a follow-up question, consider the conversation history"""
+- If asked a follow-up question, consider the conversation history
+
+CITATION REQUIREMENTS:
+- Use inline citations [1], [2], [3] etc. throughout your answer
+- Each citation should reference a specific document number from the retrieved documents
+- Add a "## References" section at the end with full details for each citation
+- Each reference should include:
+  * [Number] Client Name | Title | Date
+  * Format date as YYYY-MM-DD
+  * Example: [1] PACIFIC LIFE INSURANCE COMPANY | Email Correspondence: BofA Research - Tony Lee | 2025-09-25
+
+Example answer format:
+According to recent discussions with clients [1][2], the AI market shows strong growth potential. Companies are particularly interested in productivity tools [3].
+
+## References
+[1] BLACKROCK | AI Investment Strategy Meeting | 2025-09-15
+[2] CITADEL SECURITIES | Technology Trends Discussion | 2025-09-20
+[3] MILLENNIUM | AI Product Demo | 2025-09-22"""
 
         messages.append({"role": "system", "content": system_prompt})
 
@@ -394,7 +411,7 @@ Instructions:
 
 Question: {question}
 
-Please answer the question based on the documents provided above."""
+Please answer the question based on the documents provided above. Include inline citations [1], [2], [3] etc. and add a References section at the end."""
 
         messages.append({"role": "user", "content": user_message})
 
