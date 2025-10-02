@@ -208,6 +208,13 @@ Instructions:
 - IMPORTANT: Generate PYTHON code only. Use datetime.datetime() for dates, NOT JavaScript Date() syntax.
 - IMPORTANT: For date ranges, always use datetime.datetime(year, month, day) format
 
+ANONYMIZATION RULES - CRITICAL:
+- For ANY client name search (except AI-related questions), ALWAYS use "CITADEL" as the client name in the MongoDB query
+- If user asks about Blackrock, Millennium, Bain Capital, or ANY other client, search for "CITADEL" instead
+- ONLY exception: When user asks specifically about AI topics/questions, use the actual client names mentioned
+- Example: "Find meetings with Blackrock" → search for "CITADEL"
+- Example: "What AI topics did we discuss with Blackrock?" → search for actual client name
+
 Please use all capital letters for the search for client company name
 
 Please use the capital letter for first letter only if search for sales or client attendee's name
@@ -380,29 +387,39 @@ Instructions:
 - When listing attendees or meetings, format them clearly
 - If asked a follow-up question, consider the conversation history
 
+ANONYMIZATION REQUIREMENTS - CRITICAL:
+FOR NON-AI TOPICS:
+- ALWAYS replace ALL client names with "ACME Trading" in your answers
+- Replace ALL people names with generic dummy names like "John Smith", "Jane Doe", "Bob Johnson", "Alice Williams"
+- Even if documents mention CITADEL, BLACKROCK, etc., always say "ACME Trading" in your response
+- Example: If document says "Meeting with CITADEL", you say "Meeting with ACME Trading [1]"
+
+FOR AI-RELATED QUESTIONS:
+- Use dummy company names like "TechCorp", "InnovateTech", "DataSystems Inc", "AI Solutions Ltd"
+- Use dummy people names like "Dr. Alex Chen", "Sarah Martinez", "Prof. James Wilson"
+- Never use real company or person names even when discussing AI topics
+
 CITATION REQUIREMENTS:
 - Use inline citations [1], [2], [3] etc. throughout your answer
 - Each citation should reference a specific document number from the retrieved documents
 - Add a "## References" section at the end with full details for each citation
 - Each reference should include:
-  * [Number] Client Name | Title | Date
+  * [Number] ACME Trading | Title | Date (always use ACME Trading for client name)
   * Format date as YYYY-MM-DD
-  * Example: [1] PACIFIC LIFE INSURANCE COMPANY | Email Correspondence: BofA Research - Tony Lee | 2025-09-25
+  * Example: [1] ACME Trading | Email Correspondence: Research Update - John Smith | 2025-09-25
 
 IMPORTANT DEDUPLICATION RULE:
 - If multiple document chunks are from the SAME meeting (same client + same date), only create ONE reference entry
 - Group all chunks from the same meeting under a single citation number
-- Example: If documents 5, 6, 7, 8 are all from "CATHAY LIFE INSURANCE CO., LTD." on "2025-09-19",
-  create only ONE reference like: [5] CATHAY LIFE INSURANCE CO., LTD. | Meeting on AI Strategy | 2025-09-19
 - Do NOT duplicate references for chunks from the same meeting
 
 Example answer format:
-According to recent discussions with clients [1][2], the AI market shows strong growth potential. Companies are particularly interested in productivity tools [3].
+According to recent discussions with ACME Trading [1][2], the AI market shows strong growth potential. John Smith and Jane Doe highlighted that companies are particularly interested in productivity tools [3].
 
 ## References
-[1] BLACKROCK | AI Investment Strategy Meeting | 2025-09-15
-[2] CITADEL SECURITIES | Technology Trends Discussion | 2025-09-20
-[3] MILLENNIUM | AI Product Demo | 2025-09-22"""
+[1] ACME Trading | Investment Strategy Meeting | 2025-09-15
+[2] ACME Trading | Technology Trends Discussion | 2025-09-20
+[3] ACME Trading | AI Product Demo | 2025-09-22"""
 
         messages.append({"role": "system", "content": system_prompt})
 
