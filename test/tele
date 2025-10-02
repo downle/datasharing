@@ -1,0 +1,1026 @@
+#!/usr/bin/env python3
+"""
+MongoDB RAG Chatbot - Convert natural language to MongoDB queries and answer questions
+"""
+
+import streamlit as st
+import os
+import time
+import re
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from pymongo import MongoClient
+from langchain_community.chat_models import ChatOpenAI
+from dotenv import load_dotenv
+import json
+
+# Load environment variables
+load_dotenv()
+
+st.set_page_config(
+    page_title="MongoDB RAG Chatbot",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ============= Configuration =============
+class AppConfig:
+    """Application configuration - Load from .env file"""
+
+    # LLM Configuration - Load from .env only
+    LLM_MODEL = os.getenv("LLM_MODEL")
+    LLM_API_KEY = os.getenv("LLM_API_KEY")
+    LLM_API_BASE = os.getenv("LLM_API_BASE")
+    LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+    LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
+
+    # MongoDB Configuration - Load from .env only
+    MONGO_DB = os.getenv("MONGO_DB")
+    MONGO_COLLECTION = os.getenv("MONGO_COLLECTION")
+    MONGO_USERNAME = os.getenv("MONGO_USERNAME")
+    MONGO_PASSWORD = os.getenv("MONGO_PASSWORD", "")
+    MONGO_HOST = os.getenv("MONGO_HOST")
+    MONGO_PORT = int(os.getenv("MONGO_PORT", "27080"))
+    MONGO_TLS_CA_FILE = os.getenv("MONGO_TLS_CA_FILE")
+
+    # Full MongoDB URI from .env
+    MONGO_URI = os.getenv("MONGO_URI")
+
+
+# ============= MongoDB Connection =============
+class MongoDBConnector:
+    """Handles MongoDB connection and operations"""
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.client = None
+        self.db = None
+        self.collection = None
+
+    def connect(self, password: Optional[str] = None) -> bool:
+        """Connect to MongoDB"""
+        try:
+            # Build connection URI matching the exact format from mongo.png
+            pwd = password or self.config.MONGO_PASSWORD or ""
+
+            if self.config.MONGO_URI:
+                uri = self.config.MONGO_URI
+            else:
+                # Construct URI from components - exact format from screenshot
+                uri = (
+                    f"mongodb://{self.config.MONGO_USERNAME}:{pwd}"
+                    f"@{self.config.MONGO_HOST}:{self.config.MONGO_PORT}/"
+                    f"?authMechanism=PLAIN&authSource=$external&tls=true&tlsCAFile={self.config.MONGO_TLS_CA_FILE}"
+                )
+
+            # No additional TLS kwargs needed - included in URI
+            self.client = MongoClient(uri)
+            self.db = self.client[self.config.MONGO_DB]
+            self.collection = self.db[self.config.MONGO_COLLECTION]
+
+            # Test connection
+            self.client.server_info()
+            return True
+
+        except Exception as e:
+            st.error(f"MongoDB connection failed: {str(e)}")
+            return False
+
+    def execute_query(self, query: Dict) -> List[Dict]:
+        """Execute MongoDB query and return documents"""
+        try:
+            results = self.collection.find(query)
+            docs = list(results)
+            return docs
+        except Exception as e:
+            st.error(f"Query execution failed: {str(e)}")
+            return []
+
+    def get_collection_stats(self) -> Dict:
+        """Get collection statistics"""
+        try:
+            stats = self.db.command("collstats", self.config.MONGO_COLLECTION)
+            count = self.collection.count_documents({})
+
+            return {
+                "total_documents": count,
+                "size_mb": stats.get("size", 0) / (1024 * 1024),
+                "avg_doc_size": stats.get("avgObjSize", 0),
+                "indexes": len(stats.get("indexSizes", {}))
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_sample_document(self) -> Optional[Dict]:
+        """Get a sample document to understand schema"""
+        try:
+            doc = self.collection.find_one()
+            if doc:
+                # Remove large fields for display
+                if '_id' in doc:
+                    doc['_id'] = str(doc['_id'])
+                if 'embedding' in doc:
+                    doc['embedding'] = f"[{len(doc['embedding'])} dimensions]"
+            return doc
+        except Exception as e:
+            st.error(f"Failed to get sample: {str(e)}")
+            return None
+
+
+# ============= LLM Client =============
+class LLMClient:
+    """Handles LLM interactions using LangChain ChatOpenAI"""
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.client = ChatOpenAI(
+            model=config.LLM_MODEL,
+            openai_api_key=config.LLM_API_KEY,
+            openai_api_base=config.LLM_API_BASE,
+            max_tokens=config.LLM_MAX_TOKENS,
+            temperature=config.LLM_TEMPERATURE
+        )
+
+    def generate_mongodb_query(self, question: str, schema_info: str, conversation_history: List[Dict] = None) -> Dict:
+        """Generate MongoDB query from natural language using LLM with conversation context"""
+
+        # EXACT system prompt from the screenshot with full metadata schema
+        system_prompt = """You are an AI assistant that converts natural language requests into MongoDB queries. The data is stored in a MongoDB collection where each document follows the structure below. Use this metadata to understand the schema and generate accurate queries compatible with MongoDB syntax.
+
+Each document has the following structure:
+
+{{
+    "_id": String,
+    "chunk_number": Int,
+    "chunk_strategy": Int,
+    "content": {{
+        "content": String
+    }},
+    "document_id": String,
+    "metadata": {{
+        sent_on_datetime: ISODate,
+        job_id: String or null,
+        content_title: String,
+        content_display: String,
+        document_id: Int,
+        activity_id: String,
+        activity_type: String,
+        activity_sub_type: String,
+        activity_description: String,
+        event_type: String,
+        activity_date: ISODate,
+        etl_load_date: ISODate,
+        created_date: ISODate,
+        updated_date: ISODate,
+        sales_attendees: [
+            {{
+                sales_first_name: String,
+                sales_last_name: String,
+                sales_team: String,
+                sales_person_id: String,
+            }}
+        ],
+        client_attendees: [
+            {{
+                client_first_name: String,
+                client_last_name: String,
+                client_contact_email: String,
+                client_contact_key: String,
+                client_contact_id: String,
+                master_client_name: String
+            }}
+        ],
+        unique_id: String
+    }},
+    number_of_chunks: Int,
+    time_created: ISODate,
+    time_updated: ISODate
+}}
+
+Instructions:
+- Translate natural language queries into MongoDB queries using the above schema.
+- Use dot notation for nested fields (e.g., "metadata.sales_attendees", "metadata.client_attendees").
+- Use $elemMatch for filtering arrays of objects.
+- Use $regex with $options: "i" for case-insensitive text search.
+- Use regular expressions for partial matches.
+- Return only the MongoDB query, no explanation or commentary.
+- IMPORTANT: Generate PYTHON code only. Use datetime.datetime() for dates, NOT JavaScript Date() syntax.
+- IMPORTANT: For date ranges, always use datetime.datetime(year, month, day) format
+
+Please use all capital letters for the search for client company name
+
+Please use the capital letter for first letter only if search for sales or client attendee's name
+
+Please use activity_date if asked for time
+
+Please generate the python code with the fix collection like results = collection.find(query) and return the document with all the docs in it with docs = list(results)
+
+Date Handling Rules:
+- Always use Python's datetime.datetime() constructor, NOT JavaScript's new Date()
+- For "last month", use: datetime.datetime(datetime.datetime.now().year, datetime.datetime.now().month - 1, 1) for start date
+- For month ranges, use $gte and $lt operators
+- Import datetime at the top if needed
+
+Examples:
+1. "Find all documents where Seema Saigal was a sales attendee."
+
+query = {{
+    "metadata.sales_attendees": {{
+        "$elemMatch": {{
+            "sales_first_name": "Seema",
+            "sales_last_name": "Saigal"
+        }}
+    }}
+}}
+results = collection.find(query)
+docs = list(results)
+
+2. "Find all MILLENNIUM meeting."
+
+query = {{
+    "metadata.client_attendees": {{
+        "$elemMatch": {{
+            "master_client_name": {{"$regex": "MILLENNIUM", "$options": "i"}}
+        }}
+    }}
+}}
+results = collection.find(query)
+docs = list(results)
+
+3. "Who attended the Blackrock's meeting last month?"
+
+query = {{
+    "metadata.client_attendees": {{
+        "$elemMatch": {{
+            "master_client_name": {{"$regex": "BLACKROCK", "$options": "i"}}
+        }}
+    }},
+    "metadata.activity_date": {{
+        "$gte": datetime.datetime(datetime.datetime.now().year, datetime.datetime.now().month - 1, 1),
+        "$lt": datetime.datetime(datetime.datetime.now().year, datetime.datetime.now().month, 1)
+    }}
+}}
+results = collection.find(query)
+docs = list(results)
+"""
+
+        messages = [
+            {"role": "system", "content": system_prompt.format(schema_info=schema_info)}
+        ]
+
+        # Add conversation history for context-aware query generation
+        if conversation_history:
+            # Add last 3 Q&A pairs for context
+            for entry in conversation_history[-3:]:
+                messages.append({
+                    "role": "user",
+                    "content": f"Previous question: {entry['question']}"
+                })
+                messages.append({
+                    "role": "assistant",
+                    "content": f"Previous query generated: {entry.get('generated_code', 'N/A')}\nAnswer summary: {entry['answer'][:200]}..."
+                })
+
+        # Add current question
+        messages.append({"role": "user", "content": question})
+
+        try:
+            # Convert messages to langchain format
+            from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+            lc_messages = []
+            for msg in messages:
+                if msg["role"] == "system":
+                    lc_messages.append(SystemMessage(content=msg["content"]))
+                elif msg["role"] == "user":
+                    lc_messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    lc_messages.append(AIMessage(content=msg["content"]))
+
+            response = self.client.invoke(lc_messages)
+            code_str = response.content
+
+            # Extract Python code from response
+            match = re.search(r'```python\s*(.*?)\s*```', code_str, re.DOTALL)
+            if match:
+                extracted_code = match.group(1).strip()
+            else:
+                extracted_code = code_str.strip()
+
+            return {
+                "success": True,
+                "code": extracted_code,
+                "raw_response": code_str
+            }
+
+        except Exception as e:
+            st.error(f"Query generation failed: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    def generate_answer(
+        self,
+        question: str,
+        documents: List[Dict],
+        chat_history: List[Dict] = None,
+        stream: bool = False
+    ) -> str:
+        """Generate answer using LLM based on retrieved documents"""
+
+        # Prepare context from documents - USE ALL CHUNKS WITH FULL CONTENT
+        context_parts = []
+        for i, doc in enumerate(documents, 1):  # Use ALL documents, not just first 10
+            # Extract key fields
+            doc_text = f"--- Document {i} ---\n"
+
+            if 'metadata' in doc:
+                metadata = doc['metadata']
+                if 'activity_date' in metadata:
+                    doc_text += f"Date: {metadata['activity_date']}\n"
+                if 'client_attendees' in metadata:
+                    clients = metadata['client_attendees']
+                    if clients:
+                        client_names = [c.get('master_client_name', '') for c in clients if isinstance(c, dict)]
+                        doc_text += f"Clients: {', '.join(client_names)}\n"
+                if 'sales_attendees' in metadata:
+                    sales = metadata['sales_attendees']
+                    if sales:
+                        sales_names = [f"{s.get('sales_first_name', '')} {s.get('sales_last_name', '')}"
+                                      for s in sales if isinstance(s, dict)]
+                        doc_text += f"Sales: {', '.join(sales_names)}\n"
+
+            # USE FULL CONTENT - no truncation
+            if 'content' in doc:
+                content = doc['content']
+                if isinstance(content, dict):
+                    content_str = content.get('content', '')
+                else:
+                    content_str = str(content)
+                doc_text += f"\nContent:\n{content_str}\n"
+            elif 'text' in doc:
+                doc_text += f"\nContent:\n{str(doc['text'])}\n"
+
+            context_parts.append(doc_text)
+
+        context = "\n\n".join(context_parts)
+
+        # Build conversation history
+        messages = []
+
+        system_prompt = """You are a helpful AI assistant that answers questions based on the provided meeting documents.
+
+Instructions:
+- Answer questions accurately using ONLY the information from the provided documents
+- If the documents don't contain enough information, say so clearly
+- Provide detailed, well-structured answers
+- Use markdown formatting for better readability
+- When listing attendees or meetings, format them clearly
+- If asked a follow-up question, consider the conversation history"""
+
+        messages.append({"role": "system", "content": system_prompt})
+
+        # Add conversation history
+        if chat_history:
+            for entry in chat_history[-5:]:  # Last 5 exchanges
+                messages.append({"role": "user", "content": entry["question"]})
+                messages.append({"role": "assistant", "content": entry["answer"]})
+
+        # Add current question with context
+        user_message = f"""Documents Retrieved:
+{context}
+
+Question: {question}
+
+Please answer the question based on the documents provided above."""
+
+        messages.append({"role": "user", "content": user_message})
+
+        try:
+            if stream:
+                return self._generate_streaming(messages)
+            else:
+                # Convert messages to langchain format
+                from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+                lc_messages = []
+                for msg in messages:
+                    if msg["role"] == "system":
+                        lc_messages.append(SystemMessage(content=msg["content"]))
+                    elif msg["role"] == "user":
+                        lc_messages.append(HumanMessage(content=msg["content"]))
+                    elif msg["role"] == "assistant":
+                        lc_messages.append(AIMessage(content=msg["content"]))
+
+                response = self.client.invoke(lc_messages)
+                return response.content
+
+        except Exception as e:
+            st.error(f"Answer generation failed: {str(e)}")
+            return f"Error generating answer: {str(e)}"
+
+    def _generate_streaming(self, messages: List[Dict]) -> str:
+        """Generate streaming response using LangChain"""
+        try:
+            # Convert messages to langchain format
+            from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+            lc_messages = []
+            for msg in messages:
+                if msg["role"] == "system":
+                    lc_messages.append(SystemMessage(content=msg["content"]))
+                elif msg["role"] == "user":
+                    lc_messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    lc_messages.append(AIMessage(content=msg["content"]))
+
+            full_response = ""
+            placeholder = st.empty()
+
+            for chunk in self.client.stream(lc_messages):
+                if chunk.content:
+                    full_response += chunk.content
+                    placeholder.markdown(full_response + "▌")
+
+            placeholder.markdown(full_response)
+            return full_response
+
+        except Exception as e:
+            st.error(f"Streaming failed: {str(e)}")
+            return f"Error: {str(e)}"
+
+
+# ============= RAG System =============
+class MongoDBRAGSystem:
+    """Main RAG system using text-to-MongoDB-query approach"""
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.mongo = MongoDBConnector(config)
+        self.llm = LLMClient(config)
+        self.conversation_history = []
+        self.schema_info = ""
+
+    def initialize_schema(self):
+        """Get schema information from a sample document"""
+        sample = self.mongo.get_sample_document()
+        if sample:
+            self.schema_info = json.dumps(sample, indent=2, default=str)
+
+    def query(
+        self,
+        question: str,
+        stream_answer: bool = False
+    ) -> Dict[str, Any]:
+        """Process a question: generate query -> retrieve docs -> generate answer"""
+
+        start_time = time.time()
+        result = {
+            "success": False,
+            "mongodb_query": None,
+            "generated_code": None,
+            "documents": [],
+            "answer": "",
+            "num_docs": 0,
+            "elapsed_time": 0
+        }
+
+        # Step 1: Generate MongoDB query from natural language (with conversation context)
+        st.info("**Step 1/3:** 🔍 Converting your question to MongoDB query...")
+        query_result = self.llm.generate_mongodb_query(
+            question,
+            self.schema_info,
+            conversation_history=self.conversation_history
+        )
+
+        if not query_result["success"]:
+            result["error"] = query_result.get("error", "Failed to generate query")
+            return result
+
+        generated_code = query_result["code"]
+        result["generated_code"] = generated_code
+
+        # Show generated query
+        with st.expander("📋 Generated MongoDB Query", expanded=True):
+            st.code(generated_code, language="python")
+
+        # Step 2: Execute the query and retrieve documents
+        st.info("**Step 2/3:** 📚 Executing query and retrieving documents from MongoDB...")
+        try:
+            # Fix common JavaScript to Python syntax issues
+            cleaned_code = generated_code
+
+            # Replace JavaScript Date() with Python datetime
+            import re
+            # Replace all "new Date(" with "datetime.datetime("
+            cleaned_code = re.sub(
+                r'new\s+Date\s*\(',
+                'datetime.datetime(',
+                cleaned_code,
+                flags=re.IGNORECASE
+            )
+
+            # Fix doubled datetime.datetime.datetime to datetime.datetime
+            cleaned_code = re.sub(
+                r'datetime\.datetime\.datetime',
+                'datetime.datetime',
+                cleaned_code
+            )
+
+            # Prepare execution environment
+            exec_globals = {
+                "datetime": datetime,
+                "collection": self.mongo.collection
+            }
+
+            # Execute the generated code
+            exec(cleaned_code, exec_globals)
+
+            # Get the documents from the executed code
+            if "docs" in exec_globals:
+                documents = exec_globals["docs"]
+            elif "results" in exec_globals:
+                documents = list(exec_globals["results"])
+            else:
+                documents = []
+
+            # Also try to extract the query dict for display
+            if "query" in exec_globals:
+                result["mongodb_query"] = exec_globals["query"]
+
+        except Exception as e:
+            result["error"] = f"Query execution failed: {str(e)}"
+            st.error(f"❌ {result['error']}")
+            return result
+
+        result["documents"] = documents
+        result["num_docs"] = len(documents)
+
+        st.success(f"✅ Retrieved {len(documents)} document(s) from MongoDB")
+
+        if not documents:
+            result["success"] = True
+            result["answer"] = "No documents found matching your query."
+            result["elapsed_time"] = time.time() - start_time
+            return result
+
+        # Step 3: Generate answer from retrieved documents (chunks)
+        if not stream_answer:
+            st.info("**Step 3/3:** 💭 Generating AI answer from retrieved chunks...")
+
+        answer = self.llm.generate_answer(
+            question,
+            documents,
+            chat_history=self.conversation_history,
+            stream=stream_answer
+        )
+
+        if not stream_answer:
+            st.success("✅ Answer generated successfully!")
+
+        # Step 4: Update conversation history (with generated code for context)
+        self.conversation_history.append({
+            "question": question,
+            "answer": answer,
+            "generated_code": generated_code,
+            "mongodb_query": result.get("mongodb_query"),
+            "num_docs": len(documents),
+            "timestamp": datetime.now().isoformat()
+        })
+
+        # Keep only recent history
+        if len(self.conversation_history) > 10:
+            self.conversation_history = self.conversation_history[-10:]
+
+        result["success"] = True
+        result["answer"] = answer
+        result["elapsed_time"] = time.time() - start_time
+
+        return result
+
+    def clear_history(self):
+        """Clear conversation history"""
+        self.conversation_history = []
+
+
+# ============= Streamlit UI =============
+def main():
+    st.title("📚 MongoDB RAG Chatbot")
+    st.markdown("*Natural Language to MongoDB Query + AI Answer Generation*")
+
+    # Initialize session state
+    if 'config' not in st.session_state:
+        st.session_state.config = AppConfig()
+
+    if 'rag_system' not in st.session_state:
+        st.session_state.rag_system = None
+
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+
+    if 'connected' not in st.session_state:
+        st.session_state.connected = False
+
+    if 'auto_connect_attempted' not in st.session_state:
+        st.session_state.auto_connect_attempted = False
+
+    # Auto-connect on startup if not already attempted
+    if not st.session_state.auto_connect_attempted:
+        st.session_state.auto_connect_attempted = True
+
+        # Show connection status banner
+        status_placeholder = st.empty()
+
+        with status_placeholder:
+            with st.spinner("🔄 Connecting to MongoDB..."):
+                try:
+                    rag_system = MongoDBRAGSystem(st.session_state.config)
+                    if rag_system.mongo.connect():
+                        rag_system.initialize_schema()
+                        st.session_state.rag_system = rag_system
+                        st.session_state.connected = True
+                        st.success("✅ MongoDB Connected Successfully!")
+
+                        # Show connection details
+                        stats = rag_system.mongo.get_collection_stats()
+                        if "error" not in stats:
+                            st.info(f"📊 Database: **{st.session_state.config.MONGO_DB}** | Collection: **{st.session_state.config.MONGO_COLLECTION}** | Documents: **{stats['total_documents']:,}**")
+
+                        time.sleep(2)  # Show success message for 2 seconds
+                        status_placeholder.empty()
+                    else:
+                        st.session_state.connected = False
+                        st.error("❌ MongoDB Connection Failed - Please check settings in sidebar")
+                except Exception as e:
+                    st.session_state.connected = False
+                    st.error(f"❌ MongoDB Connection Error: {str(e)}")
+                    st.info("👈 Please configure MongoDB settings in sidebar")
+
+    # Sidebar Configuration
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+
+        with st.expander("🔧 LLM Settings", expanded=False):
+            st.session_state.config.LLM_MODEL = st.text_input(
+                "Model Name",
+                value=st.session_state.config.LLM_MODEL,
+                help="LLM model identifier"
+            )
+
+            st.session_state.config.LLM_API_KEY = st.text_input(
+                "API Key",
+                value=st.session_state.config.LLM_API_KEY,
+                type="password",
+                help="OpenAI API key"
+            )
+
+            st.session_state.config.LLM_API_BASE = st.text_input(
+                "API Base URL",
+                value=st.session_state.config.LLM_API_BASE,
+                help="Base URL for API endpoint"
+            )
+
+            st.session_state.config.LLM_MAX_TOKENS = st.number_input(
+                "Max Tokens",
+                value=st.session_state.config.LLM_MAX_TOKENS,
+                min_value=100,
+                max_value=8000,
+                step=100
+            )
+
+            st.session_state.config.LLM_TEMPERATURE = st.slider(
+                "Temperature",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state.config.LLM_TEMPERATURE),
+                step=0.1
+            )
+
+        with st.expander("🗄️ MongoDB Settings", expanded=not st.session_state.connected):
+            st.session_state.config.MONGO_HOST = st.text_input(
+                "MongoDB Host",
+                value=st.session_state.config.MONGO_HOST
+            )
+
+            st.session_state.config.MONGO_PORT = st.number_input(
+                "Port",
+                value=st.session_state.config.MONGO_PORT,
+                min_value=1,
+                max_value=65535
+            )
+
+            st.session_state.config.MONGO_USERNAME = st.text_input(
+                "Username",
+                value=st.session_state.config.MONGO_USERNAME
+            )
+
+            mongo_password = st.text_input(
+                "Password",
+                type="password",
+                help="MongoDB password"
+            )
+
+            st.session_state.config.MONGO_DB = st.text_input(
+                "Database",
+                value=st.session_state.config.MONGO_DB
+            )
+
+            st.session_state.config.MONGO_COLLECTION = st.text_input(
+                "Collection",
+                value=st.session_state.config.MONGO_COLLECTION
+            )
+
+            if st.button("🔌 Connect to MongoDB", use_container_width=True):
+                with st.spinner("Connecting..."):
+                    rag_system = MongoDBRAGSystem(st.session_state.config)
+                    if rag_system.mongo.connect(mongo_password):
+                        rag_system.initialize_schema()
+                        st.session_state.rag_system = rag_system
+                        st.session_state.connected = True
+                        st.success("✅ Connected successfully!")
+                        st.rerun()
+                    else:
+                        st.session_state.connected = False
+
+        # Connection status
+        if st.session_state.connected:
+            st.success("🟢 MongoDB Connected")
+
+            # Show collection stats
+            if st.session_state.rag_system:
+                stats = st.session_state.rag_system.mongo.get_collection_stats()
+                if "error" not in stats:
+                    st.metric("Total Documents", f"{stats['total_documents']:,}")
+                    st.metric("Collection Size", f"{stats['size_mb']:.2f} MB")
+        else:
+            st.warning("🔴 Not Connected")
+
+        st.markdown("---")
+
+        # Settings
+        with st.expander("🔍 Answer Settings", expanded=False):
+            st.session_state.stream_answer = st.checkbox(
+                "Stream Answers",
+                value=True,
+                help="Display answers as they're generated"
+            )
+
+            st.session_state.show_query = st.checkbox(
+                "Show Generated Query",
+                value=True,
+                help="Display the MongoDB query generated from your question"
+            )
+
+        st.markdown("---")
+
+        # Quick Actions
+        st.markdown("### 🛠️ Actions")
+
+        if st.button("🗑️ Clear Chat", use_container_width=True):
+            st.session_state.chat_history = []
+            if st.session_state.rag_system:
+                st.session_state.rag_system.clear_history()
+            st.rerun()
+
+        if st.button("🔄 Disconnect", use_container_width=True, disabled=not st.session_state.connected):
+            st.session_state.connected = False
+            st.session_state.rag_system = None
+            st.rerun()
+
+    # Main Chat Interface
+    if not st.session_state.connected:
+        st.info("👈 Please configure and connect to MongoDB in the sidebar to start chatting.")
+
+        # Show example
+        with st.expander("📖 How It Works"):
+            st.markdown("""
+            ### Natural Language to MongoDB Query
+
+            This chatbot uses LLM to convert your natural language questions into MongoDB queries,
+            retrieves the relevant documents, and then generates comprehensive answers.
+
+            **Example Flow:**
+            1. **Question:** "Find all MILLENNIUM meetings"
+            2. **Generated Query:**
+            ```python
+            query = {
+                "metadata.client_attendees": {
+                    "$elemMatch": {
+                        "master_client_name": {"$regex": "MILLENNIUM", "$options": "i"}
+                    }
+                }
+            }
+            ```
+            3. **Retrieved:** Documents matching the query
+            4. **Answer:** AI-generated summary based on the documents
+
+            **Try questions like:**
+            - "Find all meetings with Blackrock"
+            - "Who attended the latest meeting with Citadel?"
+            - "What topics were discussed in meetings hosted by Jodie Lowe?"
+            - "Show me all meetings from last month"
+            """)
+        return
+
+    # Chat container
+    chat_container = st.container(height=500)
+
+    with chat_container:
+        if len(st.session_state.chat_history) == 0:
+            # Welcome message
+            with st.chat_message("assistant", avatar="🤖"):
+                st.markdown("""
+                ### 👋 Hello! I'm your MongoDB RAG Assistant
+
+                I convert your questions into MongoDB queries and provide AI-generated answers!
+
+                **Features:**
+                - 🔍 Natural language to MongoDB query conversion
+                - 💬 Follow-up question support with conversation memory
+                - 📊 View generated queries and retrieved documents
+                - ⚡ Real-time streaming responses
+
+                **Try asking:**
+                - "Find all MILLENNIUM meetings"
+                - "Who attended Blackrock's meeting last month?"
+                - "What topics we have discussed with Citadel Securities in August 2025?"
+                - "Find all meetings hosted by Jodie Lowe"
+
+                Just type your question below! 👇
+                """)
+        else:
+            # Display chat history
+            for chat_idx, chat in enumerate(st.session_state.chat_history):
+                # User question
+                with st.chat_message("user", avatar="👤"):
+                    st.write(chat["question"])
+
+                # Assistant answer
+                with st.chat_message("assistant", avatar="🤖"):
+                    # Show thinking process FIRST
+                    if "metadata" in chat and chat["metadata"]:
+                        metadata = chat["metadata"]
+
+                        # Always show the thinking process box
+                        st.info("### 🧠 Thinking Process")
+
+                        # Show generated query prominently
+                        if metadata.get("generated_code"):
+                            st.markdown("**Step 1: Generated MongoDB Query**")
+                            st.code(metadata["generated_code"], language="python")
+
+                        # Show retrieval results
+                        if metadata.get("num_docs", 0) > 0:
+                            st.markdown(f"**Step 2: Retrieved {metadata.get('num_docs', 0)} document chunk(s)** ✅")
+
+                        st.markdown("**Step 3: Generating answer from chunks...**")
+                        st.markdown("---")
+
+                    # Then show the answer
+                    st.markdown("### 💬 Answer")
+                    st.markdown(chat["answer"])
+
+                    # Expandable detailed view
+                    if "metadata" in chat and chat["metadata"]:
+                        with st.expander("📊 View Full Details & Retrieved Chunks", expanded=False):
+                            metadata = chat["metadata"]
+
+                            # Metrics
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Documents Retrieved", metadata.get("num_docs", 0))
+                            with col2:
+                                st.metric("Query Success", "✅" if metadata.get("success") else "❌")
+                            with col3:
+                                st.metric("Time", f"{metadata.get('elapsed_time', 0):.2f}s")
+
+                            # Show MongoDB query dict
+                            if metadata.get("mongodb_query"):
+                                st.markdown("---")
+                                st.markdown("**📋 MongoDB Query Filter (JSON):**")
+                                st.json(metadata["mongodb_query"])
+
+                            # Show ALL retrieved documents with full content
+                            if metadata.get("documents"):
+                                st.markdown("---")
+                                st.markdown(f"**📄 All Retrieved Chunks ({len(metadata['documents'])} total):**")
+
+                                for i, doc in enumerate(metadata["documents"], 1):
+                                    with st.container():
+                                        st.markdown(f"#### Chunk {i}")
+
+                                        # Show metadata
+                                        if 'metadata' in doc:
+                                            doc_meta = doc['metadata']
+
+                                            # Extract key info
+                                            st.markdown("**Meeting Info:**")
+                                            if 'activity_date' in doc_meta:
+                                                st.write(f"📅 Date: {doc_meta['activity_date']}")
+                                            if 'content_title' in doc_meta:
+                                                st.write(f"📝 Title: {doc_meta['content_title']}")
+
+                                            # Client attendees
+                                            if 'client_attendees' in doc_meta and doc_meta['client_attendees']:
+                                                clients = [ca.get('master_client_name', 'N/A') for ca in doc_meta['client_attendees'] if isinstance(ca, dict)]
+                                                st.write(f"👥 Client: {', '.join(clients)}")
+
+                                            # Sales attendees
+                                            if 'sales_attendees' in doc_meta and doc_meta['sales_attendees']:
+                                                sales = [f"{sa.get('sales_first_name', '')} {sa.get('sales_last_name', '')}" for sa in doc_meta['sales_attendees'] if isinstance(sa, dict)]
+                                                st.write(f"💼 Sales: {', '.join(sales)}")
+
+                                        # Show content
+                                        st.markdown("**Content:**")
+                                        content_text = ""
+                                        if 'content' in doc:
+                                            if isinstance(doc['content'], dict):
+                                                content_text = doc['content'].get('content', '')
+                                            else:
+                                                content_text = str(doc['content'])
+                                        elif 'text' in doc:
+                                            content_text = doc['text']
+
+                                        # Show in text area for better readability with unique key
+                                        st.text_area(
+                                            f"chunk_content_chat{chat_idx}_doc{i}",
+                                            value=content_text,
+                                            height=150,
+                                            label_visibility="collapsed",
+                                            disabled=True
+                                        )
+
+                                        # Divider between chunks
+                                        if i < len(metadata["documents"]):
+                                            st.markdown("---")
+
+    # Input area
+    st.markdown("---")
+
+    col1, col2 = st.columns([5, 1])
+
+    with col1:
+        question = st.text_input(
+            "💬 Ask a question:",
+            placeholder="E.g., Find all meetings with Blackrock last month",
+            label_visibility="visible",
+            key="question_input"
+        )
+
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        ask_button = st.button("🚀 Ask", type="primary", use_container_width=True)
+
+    # Process question
+    if ask_button and question:
+        if not st.session_state.rag_system:
+            st.error("Please connect to MongoDB first!")
+        else:
+            # Add user question to chat
+            with chat_container:
+                with st.chat_message("user", avatar="👤"):
+                    st.write(question)
+
+                with st.chat_message("assistant", avatar="🤖"):
+                    # Execute query
+                    result = st.session_state.rag_system.query(
+                        question,
+                        stream_answer=st.session_state.stream_answer
+                    )
+
+                    if result["success"]:
+                        # Store in history
+                        st.session_state.chat_history.append({
+                            "question": question,
+                            "answer": result["answer"],
+                            "metadata": {
+                                "generated_code": result.get("generated_code"),
+                                "mongodb_query": result.get("mongodb_query"),
+                                "documents": result.get("documents", []),
+                                "num_docs": result.get("num_docs", 0),
+                                "elapsed_time": result.get("elapsed_time", 0),
+                                "success": True
+                            }
+                        })
+                    else:
+                        error_msg = result.get("error", "Unknown error")
+                        st.error(f"❌ {error_msg}")
+
+                        # Still store in history with error
+                        st.session_state.chat_history.append({
+                            "question": question,
+                            "answer": f"Error: {error_msg}",
+                            "metadata": {
+                                "generated_code": result.get("generated_code"),
+                                "success": False,
+                                "num_docs": 0
+                            }
+                        })
+
+            st.rerun()
+
+
+if __name__ == "__main__":
+    main()
