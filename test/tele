@@ -389,6 +389,13 @@ CITATION REQUIREMENTS:
   * Format date as YYYY-MM-DD
   * Example: [1] PACIFIC LIFE INSURANCE COMPANY | Email Correspondence: BofA Research - Tony Lee | 2025-09-25
 
+IMPORTANT DEDUPLICATION RULE:
+- If multiple document chunks are from the SAME meeting (same client + same date), only create ONE reference entry
+- Group all chunks from the same meeting under a single citation number
+- Example: If documents 5, 6, 7, 8 are all from "CATHAY LIFE INSURANCE CO., LTD." on "2025-09-19",
+  create only ONE reference like: [5] CATHAY LIFE INSURANCE CO., LTD. | Meeting on AI Strategy | 2025-09-19
+- Do NOT duplicate references for chunks from the same meeting
+
 Example answer format:
 According to recent discussions with clients [1][2], the AI market shows strong growth potential. Companies are particularly interested in productivity tools [3].
 
