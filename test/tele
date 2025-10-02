@@ -883,27 +883,21 @@ def main():
 
                 # Assistant answer
                 with st.chat_message("assistant", avatar="🤖"):
-                    # Show thinking process FIRST
+                    # Pre Process expander FIRST (collapsed by default)
                     if "metadata" in chat and chat["metadata"]:
                         metadata = chat["metadata"]
 
-                        # Always show the thinking process box
-                        st.info("### 🧠 Thinking Process")
+                        with st.expander("▶ Pre Process", expanded=False):
+                            # Show generated query
+                            if metadata.get("generated_code"):
+                                st.markdown("**Generated MongoDB Query:**")
+                                st.code(metadata["generated_code"], language="python")
 
-                        # Show generated query prominently
-                        if metadata.get("generated_code"):
-                            st.markdown("**Step 1: Generated MongoDB Query**")
-                            st.code(metadata["generated_code"], language="python")
+                            # Show retrieval results
+                            if metadata.get("num_docs", 0) > 0:
+                                st.success(f"✅ Retrieved {metadata.get('num_docs', 0)} document chunk(s)")
 
-                        # Show retrieval results
-                        if metadata.get("num_docs", 0) > 0:
-                            st.markdown(f"**Step 2: Retrieved {metadata.get('num_docs', 0)} document chunk(s)** ✅")
-
-                        st.markdown("**Step 3: Generating answer from chunks...**")
-                        st.markdown("---")
-
-                    # Then show the answer
-                    st.markdown("### 💬 Answer")
+                    # Show answer (no heading, just content)
                     st.markdown(chat["answer"])
 
                     # Expandable detailed view
